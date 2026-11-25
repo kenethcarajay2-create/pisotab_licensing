@@ -21,3 +21,5 @@ services:
         generateValue: true
       - key: LICENSE_PEPPER
         generateValue: true
+      - key: LICENSE_SIGNING_PRIVATE_KEY_B64
+        sync: false

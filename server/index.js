@@ -8,6 +8,7 @@ import { z } from 'zod';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, getClient } from './db.js';
+import { deviceLicenseRouter, prepareDeviceLicenseIndexes, signingKey } from './device-license.js';
 import { digest, hashPassword, verifyPassword, token, newLicenseKey, licenseMask, serializeLicense } from './security.js';
 
 const production = process.env.NODE_ENV === 'production';
@@ -38,6 +39,8 @@ function originGuard(req,res,next) {
   if (!origin || origin !== expected || req.get('x-piso-tabs-request') !== 'portal') return res.status(403).json({error:'Request origin verification failed.'});
   next();
 }
+// Native device requests use signed Keystore challenges, not browser CSRF headers.
+app.use('/api/device', deviceLicenseRouter);
 app.use('/api', originGuard);
 function validObjectId(id) { return /^[a-f0-9]{24}$/i.test(id) ? new ObjectId(id) : null; }
 function parse(schema, body, res) { const result=schema.safeParse(body); if (!result.success) {res.status(400).json({error:'Invalid input',fields:result.error.flatten().fieldErrors});return null;} return result.data; }
@@ -78,7 +81,8 @@ app.get('/api/dashboard',asyncRoute(requireAdmin),asyncRoute(async(req,res)=>{
     coll.countDocuments({status:{$ne:'revoked'},expiresAt:{$lt:now}}),
     coll.countDocuments({status:{$ne:'revoked'},expiresAt:{$gte:now,$lte:new Date(Date.now()+30*86400_000)}})
   ]);
-  res.json({total,active:total-revoked-expired,revoked,expired,expiringSoon,activatedDevices:0,activationAvailable:false});
+  const activatedDevices=await database.collection('license_devices').countDocuments({revokedAt:{$exists:false}});
+  res.json({total,active:total-revoked-expired,revoked,expired,expiringSoon,activatedDevices,activationAvailable:true});
 }));
 app.get('/api/licenses',asyncRoute(requireAdmin),asyncRoute(async(req,res)=>{
   const limit=Math.min(Math.max(Number(req.query.limit)||25,1),100);
@@ -137,5 +141,5 @@ app.use(express.static(dist,{index:false,maxAge:'1h',immutable:false}));
 app.get('*',(req,res)=>res.sendFile(path.join(dist,'index.html')));
 app.use((err,req,res,next)=>{console.error('Request error:',err?.message);if(res.headersSent)return next(err);res.status(500).json({error:'Server error. Please try again.'});});
 const port=Number(process.env.PORT)||10000;
-try { await db();app.listen(port,'0.0.0.0',()=>console.log(`Piso Tabs License Portal listening on port ${port}`)); }
+try { signingKey(); await prepareDeviceLicenseIndexes(await db());app.listen(port,'0.0.0.0',()=>console.log(`Piso Tabs License Portal listening on port ${port}`)); }
 catch(error){ console.error('Startup failed:',error.message);process.exit(1); }

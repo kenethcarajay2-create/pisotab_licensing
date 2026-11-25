@@ -29,5 +29,5 @@ export function serializeLicense(item) {
     status: item.status === 'revoked' ? 'revoked' : expired ? 'expired' : item.status,
     keyHint: item.keyHint, maxDevices: item.maxDevices, activationCount: item.activationCount ?? 0,
     createdAt: item.createdAt, expiresAt: item.expiresAt, revokedAt: item.revokedAt ?? null,
-    notes: item.notes ?? '', deviceBinding: 'Not yet enabled' };
+    notes: item.notes ?? '', deviceBinding: 'Supported (per-device activations)' };
 }
