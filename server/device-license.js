@@ -7,8 +7,20 @@ import { db, getClient } from './db.js';
 import { digest } from './security.js';
 
 const router = Router();
-const limiter = rateLimit({ windowMs: 15 * 60_000, limit: 40, standardHeaders: 'draft-7', legacyHeaders: false });
+const limiter = rateLimit({ windowMs: 15 * 60_000, limit: 600, standardHeaders: 'draft-7', legacyHeaders: false });
+// PisoTabs revocation polling v0.2.1
 router.use(limiter);
+const activationLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 40, standardHeaders: 'draft-7', legacyHeaders: false });
+router.use('/challenge', (req, res, next) => req.body?.mode === 'activate' ? activationLimiter(req, res, next) : next());
+function denial(license) {
+  if (!license) return 'LICENSE_NOT_FOUND';
+  if (license.status === 'revoked') return 'LICENSE_REVOKED';
+  if (license.expiresAt && new Date(license.expiresAt).getTime() <= Date.now()) return 'LICENSE_EXPIRED';
+  return null;
+}
+class LicenseDenied extends Error {
+  constructor(code, message) { super(message); this.denialCode = code; }
+}
 const keySchema = z.string().regex(/^PT-[A-Z2-9]{6}(?:-[A-Z2-9]{6}){3}$/);
 const startSchema = z.object({
   mode: z.enum(['activate', 'refresh']),
@@ -34,8 +46,8 @@ function makeEntitlement(license, deviceId) {
   const now = Date.now();
   const expires = license.expiresAt ? new Date(license.expiresAt).getTime() : Number.MAX_SAFE_INTEGER;
   const payload = {v:1, iss:'piso-tabs-license-api', licenseId:license._id.toString(), deviceId,
-    plan:license.plan, issuedAt:now, validUntil:Math.min(now+3*86400_000,expires),
-    renewAfter:now+12*3600_000};
+    plan:license.plan, issuedAt:now, validUntil:Math.min(now+86400_000,expires),
+    renewAfter:Math.min(now+60_000,expires)};
   const part=Buffer.from(JSON.stringify(payload)).toString('base64url');
   const signature=sign(null,Buffer.from(part,'ascii'),signingKey()).toString('base64url');
   return `${part}.${signature}`;
@@ -59,10 +71,10 @@ router.post('/challenge', async(req,res,next)=>{
     const license=input.mode==='activate'
       ? await database.collection('licenses').findOne({keyHash:digest(process.env.LICENSE_PEPPER,input.key)})
       : await database.collection('licenses').findOne({_id:new ObjectId(input.licenseId)});
-    if(!isAllowed(license)) return res.status(403).json({error:'License unavailable or expired'});
+    if(!isAllowed(license)) return res.status(403).json({error:'License unavailable or expired', ...(input.mode==='refresh' ? {code:denial(license)} : {})});
     if(input.mode==='refresh') {
       const known=await database.collection('license_devices').findOne({licenseId:license._id,deviceId,revokedAt:{$exists:false}});
-      if(!known) return res.status(403).json({error:'Device not activated for this license'});
+      if(!known) return res.status(403).json({error:'Device not activated for this license',code:'DEVICE_NOT_ACTIVATED'});
     }
     const nonce=randomBytes(32).toString('base64url');
     const expiresAt=new Date(Date.now()+3*60_000);
@@ -88,14 +100,14 @@ router.post('/complete',async(req,res,next)=>{
         const used=await database.collection('license_challenges').updateOne({_id:id,consumedAt:{$exists:false},expiresAt:{$gt:new Date()}},{$set:{consumedAt:new Date()}},{session});
         if(used.modifiedCount!==1) throw new Error('Challenge already consumed');
         const license=await database.collection('licenses').findOne({_id:challenge.licenseId},{session});
-        if(!isAllowed(license)) throw new Error('License unavailable or expired');
+        if(!isAllowed(license)) throw new LicenseDenied(denial(license),'License unavailable or expired');
         const devices=database.collection('license_devices');
         const existing=await devices.findOne({licenseId:license._id,deviceId:challenge.deviceId},{session});
         if(existing) {
-          if(existing.revokedAt || existing.devicePublicKey!==challenge.devicePublicKey) throw new Error('Device revoked or key changed');
+          if(existing.revokedAt || existing.devicePublicKey!==challenge.devicePublicKey) throw new LicenseDenied('DEVICE_REVOKED','Device revoked or key changed');
           await devices.updateOne({_id:existing._id},{$set:{lastSeenAt:new Date()}},{session});
         } else {
-          if(challenge.mode!=='activate') throw new Error('Unregistered device');
+          if(challenge.mode!=='activate') throw new LicenseDenied('DEVICE_NOT_ACTIVATED','Unregistered device');
           const claimed=await database.collection('licenses').updateOne({_id:license._id,status:{$ne:'revoked'},$expr:{$lt:['$activationCount','$maxDevices']}},{$inc:{activationCount:1}},{session});
           if(claimed.modifiedCount!==1) throw new Error('License device limit reached');
           await devices.insertOne({licenseId:license._id,deviceId:challenge.deviceId,
@@ -105,6 +117,7 @@ router.post('/complete',async(req,res,next)=>{
         issuedLicense=license;
       });
     }catch(error){
+      if(error instanceof LicenseDenied)return res.status(409).json({error:error.message,code:error.denialCode});
       if(error.code===11000)return res.status(409).json({error:'Device activation conflicted; retry with a new challenge'});
       if(/Challenge|License|Device|Unregistered/.test(error.message))return res.status(409).json({error:error.message});
       throw error;
